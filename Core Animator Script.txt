@@ -1,0 +1,356 @@
+--AnimationLiteService - Adapted verious examples to create a Procedural KeyframeSequence player using C0 so it blends with regular animations.  ScottSpiritWalker, 08/21/2025.
+
+local TS = game:GetService("TweenService")
+local runservice = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+
+local tStyle, tDirection = {
+[Enum.PoseEasingStyle.Linear]    = Enum.EasingStyle.Linear;
+[Enum.PoseEasingStyle.Bounce]    = Enum.EasingStyle.Bounce;
+[Enum.PoseEasingStyle.Cubic]     = Enum.EasingStyle.Cubic;
+[Enum.PoseEasingStyle.CubicV2]   = Enum.EasingStyle.Cubic;
+[Enum.PoseEasingStyle.Elastic]   = Enum.EasingStyle.Elastic;
+[Enum.PoseEasingStyle.Constant]  = Enum.EasingStyle.Linear;
+},{
+[Enum.PoseEasingDirection.In]    = Enum.EasingDirection.In;
+[Enum.PoseEasingDirection.Out]   = Enum.EasingDirection.Out;
+[Enum.PoseEasingDirection.InOut] = Enum.EasingDirection.InOut;
+}
+
+local ActiveAnimations = {}
+local TRANSITION_TIME = 0.25
+
+local function TransitionToOriginalPose(Model)
+    if not Model or not Model.Parent then return end
+    local tweens = {}
+    
+    for _, v in pairs(Model:GetDescendants()) do
+        if v:IsA("Motor6D") then
+            local initC0 = v:FindFirstChild("InitC0")
+            if initC0 and v.C0 ~= initC0.Value then
+                local tween = TS:Create(v, TweenInfo.new(TRANSITION_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {C0 = initC0.Value})
+                table.insert(tweens, tween)
+                tween:Play()
+            end
+        end
+    end
+    
+    if #tweens > 0 then
+        task.wait(TRANSITION_TIME)
+    end
+end
+
+local function StopCharacterAnimation(Model)
+    local animData = ActiveAnimations[Model]
+    if not animData then return end
+    
+    ActiveAnimations[Model] = nil
+    pcall(function()
+        Model:SetAttribute("AnimationLitePlaying", nil)
+    end)
+    
+    if animData.Cleanup then
+        animData.Cleanup()
+    end
+    
+    task.spawn(function()
+        TransitionToOriginalPose(Model)
+    end)
+end
+
+local function PlayKeyframeSequenceInternal(Model, KeyframeSequence, SpeedMult, StartAtFrameNum, StopAtFrameNum, currentAnimId)
+    if not Model or not Model.Parent or not KeyframeSequence or not KeyframeSequence.Parent then   --Incase the stop button destroys the model.
+        --print("Play animation aborted. Model:",Model,"KeyframeSequence",KeyframeSequence)
+        pcall(function()
+            Model:SetAttribute("AnimationLitePlaying",nil)
+        end)
+        ActiveAnimations[Model] = nil
+        return
+    end
+    
+    Model:SetAttribute("AnimationLitePlaying",true)  
+    if not SpeedMult then  
+        SpeedMult = 1  
+    end  
+    if not StopAtFrameNum then  
+        StopAtFrameNum = 9999  
+    end  
+    if (not StartAtFrameNum) or StartAtFrameNum > StopAtFrameNum or StartAtFrameNum < 1 then  
+        StartAtFrameNum = 1  
+    end  
+    
+    local AllKeyframes = {}  
+    
+    for i,Keyframe in pairs(KeyframeSequence:GetKeyframes()) do  
+        table.insert(AllKeyframes, {  
+        Time = Keyframe.Time,  
+        Keyframe = Keyframe  
+        })  
+    end  
+    table.sort(AllKeyframes, function(a, b)  
+        return a.Time < b.Time  
+    end)  
+    
+    local tweens = {}  
+    local motors = {}  
+    local motorValues = {}  
+    local KeyframePoses = {}  
+    
+    local rigMismatch = false  
+    
+    local function GetMotorFromPose(Pose, Keyframe)  
+        for i,v in pairs(Model:GetDescendants()) do  
+            if v:IsA("Motor6D") then  
+                if v.Part1 and v.Part1.Name == Pose.Name then  
+                    local initC0 = v:FindFirstChild("InitC0")  
+                    if initC0 then  
+                        v.C0 = initC0.Value  --If we played it before, reset to initial values.  
+                    else  
+                        initC0 = Instance.new("CFrameValue")  
+                        initC0.Name = "InitC0"  
+                        initC0.Value = v.C0   
+                        initC0.Parent = v  
+                    end  
+                    return v  
+                end  
+            end  
+        end  
+        rigMismatch = true  
+        return nil  
+    end  
+    
+    local excessTimeAfterLastPose = 0        -- Some anims have a special keyframe with no poses to hold the total animation length when there is unused time on the end of the animation.  
+    if #AllKeyframes > 1 and #AllKeyframes[#AllKeyframes].Keyframe:GetDescendants() == 0 then  
+        excessTimeAfterLastPose = (AllKeyframes[#AllKeyframes].Time - AllKeyframes[#AllKeyframes - 1].Time) * SpeedMult  
+        table.remove(AllKeyframes,#AllKeyframes)  
+    end   
+    
+    for i,Keyframe in pairs(AllKeyframes) do  
+        for x,Pose in pairs(Keyframe.Keyframe:GetDescendants()) do  
+            if Pose:IsA("Pose") and Pose.Weight>0 then  
+                local Motor6D = motors[Pose.Name] or GetMotorFromPose(Pose, Keyframe)  
+                if Motor6D then  
+                    if not KeyframePoses[i] then  
+                        KeyframePoses[i] = {  
+                        Time = Keyframe.Time * SpeedMult,  
+                        Poses = {}  
+                        }  
+                    end  
+                    if not motors[Pose.Name] then  
+                        motors[Pose.Name] = Motor6D  
+                    end  
+                    if not motorValues[Pose.Name] then  
+                        local mv = motors[Pose.Name]:FindFirstChild("MotorValue")  
+                        if mv and mv.Name == "MotorValue" then  
+                            mv.Value = Motor6D.InitC0.Value   --Fixed initial starting point. ScottSpiritWalker, 11/04/2025.  
+                            motorValues[Pose.Name] = mv  
+                        else  
+                            local motorVal = Instance.new("CFrameValue")  
+                            motorVal.Name = "MotorValue"  
+                            motorVal.Parent = motors[Pose.Name]  
+                            motorVal.Value = Motor6D.InitC0.Value   --Fixed initial starting point. ScottSpiritWalker, 11/04/2025.  
+                            motorValues[Pose.Name] = motorVal  
+                        end  
+                    end  
+                    KeyframePoses[i].Poses[Pose.Name] = {Motor6D = Motor6D, Pose = Pose}  
+                end  
+            end  
+        end  
+    end  
+    
+    if rigMismatch and Model:FindFirstChildOfClass("Humanoid") then  
+        if Model.Humanoid.RigType == Enum.HumanoidRigType.R6 then  
+            warn("Motor mismatch:",KeyframeSequence.Name,"is an R15 animation, but the rig is R6.")  
+        elseif Model.Humanoid.RigType == Enum.HumanoidRigType.R15 then  
+            warn("Motor mismatch:",KeyframeSequence.Name,"is an R6 animation, but the rig is R15.")  
+        end  
+    end  
+    
+    if #KeyframePoses > 0 then  
+        local lastPose = {}  
+        for i = StartAtFrameNum, math.min(#KeyframePoses - 1, StopAtFrameNum) do  
+            local Kf1, Kf2   
+            if #KeyframePoses == 1 then      
+                Kf1, Kf2 = KeyframePoses[i], KeyframePoses[i]  
+                Kf1.Time, Kf2.Time = 0.001,0.002  
+            else  
+                Kf1, Kf2 = KeyframePoses[i], KeyframePoses[i+1]  
+            end  
+            
+            local t = Kf2.Time-Kf1.Time  
+            tweens[i] = {  
+            Time = t,  
+            Tweens = {}  
+            }  
+            for name,data in pairs(Kf1.Poses) do  
+                lastPose[name] = data  
+                lastPose[name].StartIndex = i    --ScottSpiritWalker - position start of tween at the true start  
+                lastPose[name].Time = Kf1.Time  
+            end  
+            
+            for name,data in pairs(Kf2.Poses) do  
+                if not lastPose[name] then            --ScottSpiritWalker - Create starting frame if none exists.  
+                    lastPose[name] = data  
+                    lastPose[name].Pose.EasingStyle = Enum.PoseEasingStyle.Linear  
+                    lastPose[name].Pose.EasingDirection = Enum.PoseEasingDirection.In  
+                    lastPose[name].Pose.CFrame = CFrame.new()  
+                    lastPose[name].Time = 0  
+                    lastPose[name].StartIndex = StartAtFrameNum  
+                    print("SL_Make StartFrame",name,data)  
+                end  
+                --print(lastPose,lastPose[name])  
+                local tweeninfo = TweenInfo.new(  
+                math.abs(lastPose[name].Time-Kf2.Time),  
+                tStyle[lastPose[name].Pose.EasingStyle],  
+                tDirection[lastPose[name].Pose.EasingDirection]  
+                )  
+                --ScottSpiritWalker - Index the tween from the start of the pose. And change values for C0, not motors, since Transform dosn't seem to work without disabling the Animator.  
+                --tweens[lastPose[name].StartIndex].Tweens[name] = TS:Create(motorValues[name],tweeninfo,{Value=CFrame.new(motors[data.Pose.Name].C0.Position) * data.Pose.CFrame})  
+                tweens[lastPose[name].StartIndex].Tweens[name] = TS:Create(motorValues[name],tweeninfo,{Value=motors[data.Pose.Name].C0 * data.Pose.CFrame})  
+                
+            end  
+        end  
+    end  
+    
+    local breakPlay = false  
+    
+    local function play()  
+        for i,v in pairs(motors) do  
+            --print("SL_motor",v.Name)  
+            local initC0 = v:FindFirstChild("InitC0")  
+            if initC0 and v.C0 ~= initC0.Value then  
+                v.C0 = initC0.Value  
+                motorValues[i].Value = initC0.Value  
+            end  
+        end  
+        for i,v in pairs(tweens) do  
+            if not Model or not Model.Parent or not KeyframeSequence or not KeyframeSequence.Parent then   --Incase the stop button destroys the model.  
+                --StopAtFrameNum = 0 --break out of play loop tool  
+                breakPlay = true  
+                break  
+            end  
+            if (not ActiveAnimations[Model] or ActiveAnimations[Model].AnimId ~= currentAnimId) then  
+                break  
+            end  
+            --if i >= StartAtFrameNum and i <= StopAtFrameNum then   
+            for _,tween in pairs(v.Tweens) do  
+                tween:Play()  
+            end  
+            task.wait(v.Time)  
+        end  
+        if ActiveAnimations[Model] and ActiveAnimations[Model].AnimId == currentAnimId then  
+            task.wait(excessTimeAfterLastPose)  
+        end  
+    end  
+    
+    local myBreak = false  
+    local myTicks = tick()  
+    local runConnection  
+    
+    runConnection = runservice.Stepped:Connect(function()  
+        for i,v in pairs(motors) do  
+            if myBreak then  
+                runConnection:Disconnect()  
+                break  
+            end  
+            if v.C0 ~= motorValues[i].Value then  
+                v.C0 = motorValues[i].Value  
+            end  
+            --v.Transform = motorValues[i].Value  
+        end  
+    end)  
+    
+    local function Cleanup()
+        myBreak = true
+        if runConnection then
+            runConnection:Disconnect()
+        end
+        for i,v in pairs(tweens) do  
+            for _,tween in pairs(v.Tweens) do  
+                tween:Cancel()  
+                tween:Destroy()  
+            end  
+        end
+    end
+    
+    if ActiveAnimations[Model] and ActiveAnimations[Model].AnimId == currentAnimId then
+        ActiveAnimations[Model].Cleanup = Cleanup
+    end
+    
+    --print("SL_Play",Model.Name,KeyframeSequence.Name)  
+    while ActiveAnimations[Model] and ActiveAnimations[Model].AnimId == currentAnimId do  
+        play()  
+        if KeyframeSequence.Loop == false or breakPlay then          
+            break  
+        end  
+    end  
+    
+    --print("SL_Disconnect",Model.Name,KeyframeSequence.Name)  
+    Cleanup()
+    
+    if ActiveAnimations[Model] and ActiveAnimations[Model].AnimId == currentAnimId then  
+        ActiveAnimations[Model] = nil  
+        pcall(function()  --Incase the stop button destroys the model.  
+            Model:SetAttribute("AnimationLitePlaying",nil)  
+        end)
+        
+        if StopAtFrameNum == 9999 then  --Play the whole animation, then reset the C0 values.  If you set a stop frame, then leave the C0 values as is (Statue mode).  
+            TransitionToOriginalPose(Model)
+        end  
+    end  
+end
+
+function OnAnimationEvent(Action, Model, KeyframeSequence, SpeedMult, StartAtFrameNum, StopAtFrameNum)
+    if not Model or not Model.Parent then return end
+    
+    local currentData = ActiveAnimations[Model]
+    
+    if Action == "PlayAnimation" then
+        if currentData then
+            print("Can't play",Model,KeyframeSequence," Previous animation is still playing.")
+            return
+        end
+        
+    elseif Action == "SwitchAnimation" then
+        if currentData then
+            StopCharacterAnimation(Model)
+        end
+        
+    elseif Action == "SetAnimation" then
+        if currentData then
+            if currentData.KeyframeSequence == KeyframeSequence then
+                return
+            else
+                StopCharacterAnimation(Model)
+            end
+        end
+        
+    elseif Action == "StopAnimation" then
+        StopCharacterAnimation(Model)
+        return
+    else
+        warn("Invalid animation action:", tostring(Action))
+        return
+    end
+    
+    local animId = HttpService:GenerateGUID(false)
+    ActiveAnimations[Model] = {
+    AnimId = animId,
+    KeyframeSequence = KeyframeSequence,
+    Cleanup = nil
+    }
+    
+    task.spawn(function()
+        PlayKeyframeSequenceInternal(Model, KeyframeSequence, SpeedMult, StartAtFrameNum, StopAtFrameNum, animId)
+    end)
+end
+
+local AnimationLitePlayEvent = game.ReplicatedStorage:FindFirstChild("AnimationEvent")
+
+if not AnimationLitePlayEvent then
+    AnimationLitePlayEvent = Instance.new("BindableEvent")
+    AnimationLitePlayEvent.Name = "AnimationEvent"
+    AnimationLitePlayEvent.Parent = game.ReplicatedStorage
+end
+
+AnimationLitePlayEvent.Event:Connect(OnAnimationEvent)
